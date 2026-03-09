@@ -116,7 +116,64 @@ pub extern "C" fn main(hart_id: usize, dtb: usize) -> ! {
 
     #[cfg(feature = "shell")]
     {
-        // TODO: Lab 0
+        const PROMPT: &str = "PKUOS> ";
+        let mut buffer: [u8; 64] = [0; 64];
+        let mut idx;
+
+        loop {
+            kprint!("{}", PROMPT);
+
+            idx = 0;
+            loop {
+                let c = sbi::console_getchar() as u8;
+
+                // Handle backspace
+                if c == b'\x7f' || c == b'\x08' {
+                    // DEL or backspace
+                    if idx > 0 {
+                        idx -= 1;
+                        kprint!("\x08 \x08"); // move back, space, move back
+                    }
+                    continue;
+                }
+
+                // Ignore non-printable except newline/return
+                if c == b'\r' || c == b'\n' {
+                    break;
+                }
+
+                // Skip if buffer full
+                if idx >= buffer.len() - 1 {
+                    continue;
+                }
+
+                buffer[idx] = c;
+                idx += 1;
+            }
+
+            // Null-terminate and parse
+            buffer[idx] = 0;
+            let input = match str::from_utf8(&buffer[..idx]) {
+                Ok(s) => s.trim(),
+                Err(_) => "",
+            };
+
+            match input {
+                "whoami" => {
+                    kprint!("2300012993\n");
+                }
+                "exit" => {
+                    kprint!("exit\n");
+                    break;
+                }
+                "" => {
+                    // empty line, do nothing
+                }
+                _ => {
+                    kprint!("invalid command\n");
+                }
+            }
+        }
     }
 
     DISKFS.unmount();
