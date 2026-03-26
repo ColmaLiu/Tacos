@@ -89,25 +89,38 @@ def lab_task(
         total_size = os.path.getsize(file_path) if file_path != "-" else 0
         uploaded_size = 0
         uuid = ""
+        buf = ""
         for response_chunk in \
             upload_file_with_streaming_response(
             url, 
             file_path, 
             chunk_size=chunk_size, timeout=timeout):
 
-            json_data = json.loads(response_chunk.decode('utf-8'))
-            if json_data["status"] == "Processing":
-                uploaded_size += json_data["progress"]
-                print(f"\rUploaded {uploaded_size}/{total_size} bytes", end='', flush=True)
-            elif json_data["status"] == "FileUploadCompleted":
-                print("\nFile upload and processing completed.")
-            elif json_data["status"] == "TooManyRequests":
-                raise Exception("Server is busy. Too many requests.")
-            elif json_data["status"] == "OK":
+            buf += response_chunk.decode('utf-8')
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                json_data = json.loads(line)
+                if json_data["status"] == "Processing":
+                    uploaded_size += json_data["progress"]
+                    print(f"\rUploaded {uploaded_size}/{total_size} bytes", end='', flush=True)
+                elif json_data["status"] == "FileUploadCompleted":
+                    print("\nFile upload and processing completed.")
+                elif json_data["status"] == "TooManyRequests":
+                    raise Exception("Server is busy. Too many requests.")
+                elif json_data["status"] == "OK":
+                    uuid = json_data["uuid"]
+                    print(f"Server response OK with UUID: {json_data['uuid']}")
+                else:
+                    raise Exception(f"Unexpected response: {json_data}")
+        # handle any remaining data in buffer (no trailing newline)
+        if buf.strip():
+            json_data = json.loads(buf.strip())
+            if json_data["status"] == "OK":
                 uuid = json_data["uuid"]
                 print(f"Server response OK with UUID: {json_data['uuid']}")
-            else:
-                raise Exception(f"Unexpected response: {json_data}")
         return uuid
     except Exception as e:
         raise Exception(f"Error during lab task: {e}")
@@ -140,24 +153,30 @@ def monitor_task(
             print(f"\n\033[0;31m[TEST FAILED]\033[0m {e}")
             return
     try:
+        buf = ""
         for chunk in monitor_reqeust_generator():
-            data = chunk.decode('utf-8')
-            json_data = json.loads(data)
-            if json_data["status"] == "QUEUE":
-                position = json_data["position"]
-                print(f"\rTask is in queue. Position: {position}", end='', flush=True)
-            elif json_data["status"] == "PROCESSING":
-                output = json_data["progress"]["output"]
-                print(f"{output}", flush=True)
-            elif json_data["status"] == "COMPLETED":
-                result_code = json_data["result"]["result_code"]
-                time = json_data["result"]["time_ms"] / 1000.0
-                if result_code == "Completed":
-                    print(f"\033[0;32m[TEST COMPLETED]\033[0m Time elapsed: {time}s")
+            buf += chunk.decode('utf-8')
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                json_data = json.loads(line)
+                if json_data["status"] == "QUEUE":
+                    position = json_data["position"]
+                    print(f"\rTask is in queue. Position: {position}", end='', flush=True)
+                elif json_data["status"] == "PROCESSING":
+                    output = json_data["progress"]["output"]
+                    print(f"{output}", flush=True)
+                elif json_data["status"] == "COMPLETED":
+                    result_code = json_data["result"]["result_code"]
+                    time = json_data["result"]["time_ms"] / 1000.0
+                    if result_code == "Completed":
+                        print(f"\033[0;32m[TEST COMPLETED]\033[0m Time elapsed: {time}s")
+                    else:
+                        print(f"\033[0;31m[TEST FAILED]\033[0m Result code: {result_code}. Time elapsed: {time}s")
                 else:
-                    print(f"\033[0;31m[TEST FAILED]\033[0m Result code: {result_code}. Time elapsed: {time}s")
-            else:
-                print(f"Oops! Something went wrong: test id not found.")
+                    print(f"Oops! Something went wrong: test id not found.")
     except Exception as e:
         print(f"\n\033[0;31m[TEST FAILED]\033[0m {e}")
         return
