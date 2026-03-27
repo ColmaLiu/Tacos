@@ -1,5 +1,7 @@
 //! Manager of all kernel threads
 
+mod sleepqueue;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
@@ -9,8 +11,10 @@ use crate::bootstack;
 use crate::mem::KernelPgTable;
 use crate::sbi::interrupt;
 use crate::sync::Lazy;
+use crate::thread::manager::sleepqueue::SleepQueue;
 use crate::thread::{
-    schedule, switch, Builder, Mutex, Schedule, Scheduler, Status, Thread, MAGIC, PRI_DEFAULT, PRI_MIN
+    schedule, switch, Builder, Mutex, Schedule, Scheduler, Status, Thread, MAGIC, PRI_DEFAULT,
+    PRI_MIN,
 };
 
 /* --------------------------------- MANAGER -------------------------------- */
@@ -20,6 +24,8 @@ pub struct Manager {
     pub scheduler: Mutex<Scheduler>,
     /// The current running thread
     pub current: Mutex<Arc<Thread>>,
+    /// Sleeping threads sorted by wakeup tick
+    pub sleep_queue: Mutex<SleepQueue>,
     /// All alive and not yet destroyed threads
     all: Mutex<Vec<Arc<Thread>>>,
 }
@@ -28,7 +34,14 @@ impl Manager {
     pub fn get() -> &'static Self {
         static TMANAGER: Lazy<Manager> = Lazy::new(|| {
             // Manully create initial thread.
-            let initial = Arc::new(Thread::new("Initial", bootstack as usize, PRI_DEFAULT, 0, None, None));
+            let initial = Arc::new(Thread::new(
+                "Initial",
+                bootstack as usize,
+                PRI_DEFAULT,
+                0,
+                None,
+                None,
+            ));
             unsafe { (bootstack as *mut usize).write(MAGIC) };
             initial.set_status(Status::Running);
 
@@ -36,6 +49,7 @@ impl Manager {
                 scheduler: Mutex::new(Scheduler::default()),
                 all: Mutex::new(Vec::from([initial.clone()])),
                 current: Mutex::new(initial),
+                sleep_queue: Mutex::new(SleepQueue::new()),
             };
 
             let idle = Builder::new(|| loop {
@@ -80,7 +94,10 @@ impl Manager {
             self.current.lock().status() == Status::Running || next.is_some(),
             "no thread is ready"
         );
-        assert!(!self.current.lock().overflow(), "Current thread has overflowed its stack.");
+        assert!(
+            !self.current.lock().overflow(),
+            "Current thread has overflowed its stack."
+        );
 
         if let Some(next) = next {
             assert_eq!(next.status(), Status::Ready);

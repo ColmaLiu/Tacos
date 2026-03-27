@@ -2,6 +2,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::fmt::{self, Debug};
 use core::sync::atomic::{AtomicIsize, AtomicU32, Ordering::SeqCst};
@@ -31,6 +32,9 @@ pub struct Thread {
     status: Mutex<Status>,
     context: Mutex<Context>,
     pub priority: AtomicU32,
+    pub effective_priority: AtomicU32,
+    pub waiting_thread: Mutex<Option<Arc<Thread>>>,
+    pub donors: Mutex<Vec<Arc<Thread>>>,
     pub userproc: Option<UserProc>,
     pub pagetable: Option<Mutex<PageTable>>,
 }
@@ -54,6 +58,9 @@ impl Thread {
             status: Mutex::new(Status::Ready),
             context: Mutex::new(Context::new(stack, entry)),
             priority: AtomicU32::new(priority),
+            effective_priority: AtomicU32::new(priority),
+            waiting_thread: Mutex::new(None),
+            donors: Mutex::new(Vec::new()),
             userproc,
             pagetable: pagetable.map(Mutex::new),
         }
@@ -181,6 +188,7 @@ impl Builder {
         kprintln!("[THREAD] create {:?}", new_thread);
 
         Manager::get().register(new_thread.clone());
+        Manager::get().schedule();
 
         // Off you go
         new_thread

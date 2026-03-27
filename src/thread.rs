@@ -5,11 +5,14 @@ pub mod manager;
 pub mod scheduler;
 pub mod switch;
 
+use crate::sbi;
+
 pub use self::imp::*;
 pub use self::manager::Manager;
 pub(self) use self::scheduler::{Schedule, Scheduler};
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering::SeqCst;
 
 /// Create a new thread
 pub fn spawn<F>(name: &'static str, f: F) -> Arc<Thread>
@@ -70,20 +73,71 @@ pub fn wake_up(thread: Arc<Thread>) {
 }
 
 /// (Lab1) Sets the current thread's priority to a given value
-pub fn set_priority(_priority: u32) {}
+pub fn set_priority(_priority: u32) {
+    assert!(PRI_MIN <= _priority && _priority <= PRI_MAX);
+    let old = sbi::interrupt::set(false);
+
+    let cur = current();
+    cur.priority.store(_priority, SeqCst);
+    let mut prio = _priority;
+    for t in cur.donors.lock().iter() {
+        let donor_prio = t.effective_priority.load(SeqCst);
+        if donor_prio > prio {
+            prio = donor_prio;
+        }
+    }
+    cur.effective_priority.store(prio, SeqCst);
+    let mut t = cur;
+    while t.waiting_thread.lock().is_some() {
+        let holder = t.waiting_thread.lock().clone().unwrap();
+        let mut prio = holder.priority.load(SeqCst);
+        for t in holder.donors.lock().iter() {
+            let donor_prio = t.effective_priority.load(SeqCst);
+            if donor_prio > prio {
+                prio = donor_prio;
+            }
+        }
+        holder.effective_priority.store(prio, SeqCst);
+        t = holder.clone();
+    }
+
+    #[cfg(feature = "thread-scheduler-priority")]
+    Manager::get().scheduler.lock().rearrange();
+
+    sbi::interrupt::set(old);
+    schedule();
+}
 
 /// (Lab1) Returns the current thread's effective priority.
 pub fn get_priority() -> u32 {
-    0
+    current().effective_priority.load(SeqCst)
 }
 
 /// (Lab1) Make the current thread sleep for the given ticks.
 pub fn sleep(ticks: i64) {
-    use crate::sbi::timer::{timer_elapsed, timer_ticks};
+    let old = sbi::interrupt::set(false);
 
-    let start = timer_ticks();
+    let current = current();
+    let start = sbi::timer::timer_ticks();
+    let wakeup_tick = if ticks <= 0 { start } else { start + ticks };
 
-    while timer_elapsed(start) < ticks {
-        schedule();
+    #[cfg(feature = "debug")]
+    kprintln!(
+        "[THREAD] {:?} sleeps at tick {} until tick {}",
+        current,
+        start,
+        wakeup_tick
+    );
+
+    if ticks > 0 {
+        Manager::get()
+            .sleep_queue
+            .lock()
+            .sleep_until(current.clone(), wakeup_tick);
+        current.set_status(Status::Blocked);
     }
+
+    sbi::interrupt::set(old);
+
+    schedule();
 }

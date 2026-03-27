@@ -70,6 +70,11 @@ pub extern "C" fn trap_handler(frame: &mut Frame) {
 
         Interrupt(SupervisorTimer) => {
             sbi::timer::tick();
+            let now = sbi::timer::timer_ticks();
+            let expired_threads = thread::Manager::get().sleep_queue.lock().wake_expired(now);
+            for thread in expired_threads {
+                thread::wake_up(thread);
+            }
             unsafe { riscv::register::sstatus::set_sie() };
             thread::schedule();
         }
