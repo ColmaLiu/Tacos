@@ -2,6 +2,7 @@
 
 mod sleepqueue;
 
+use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem;
@@ -16,6 +17,7 @@ use crate::thread::{
     schedule, switch, Builder, Mutex, Schedule, Scheduler, Status, Thread, MAGIC, PRI_DEFAULT,
     PRI_MIN,
 };
+use crate::userproc::ProcInfo;
 
 /* --------------------------------- MANAGER -------------------------------- */
 /// Global thread manager, contains a scheduler and a current thread.
@@ -26,6 +28,8 @@ pub struct Manager {
     pub current: Mutex<Arc<Thread>>,
     /// Sleeping threads sorted by wakeup tick
     pub sleep_queue: Mutex<SleepQueue>,
+    /// User process table
+    pub proc_table: Mutex<BTreeMap<isize, ProcInfo>>,
     /// All alive and not yet destroyed threads
     all: Mutex<Vec<Arc<Thread>>>,
 }
@@ -50,6 +54,7 @@ impl Manager {
                 all: Mutex::new(Vec::from([initial.clone()])),
                 current: Mutex::new(initial),
                 sleep_queue: Mutex::new(SleepQueue::new()),
+                proc_table: Mutex::new(BTreeMap::new()),
             };
 
             let idle = Builder::new(|| loop {

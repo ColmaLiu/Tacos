@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use crate::thread::Thread;
 
 #[cfg(feature = "thread-scheduler-priority")]
-// (Lab1) Your task: priority scheduling
+// Priority scheduling
 pub type Scheduler = self::priority::Priority;
 #[cfg(not(feature = "thread-scheduler-priority"))]
 pub type Scheduler = self::fcfs::Fcfs;

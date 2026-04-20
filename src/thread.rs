@@ -72,7 +72,7 @@ pub fn wake_up(thread: Arc<Thread>) {
     Manager::get().scheduler.lock().register(thread);
 }
 
-/// (Lab1) Sets the current thread's priority to a given value
+/// Sets the current thread's priority to a given value
 pub fn set_priority(_priority: u32) {
     assert!(PRI_MIN <= _priority && _priority <= PRI_MAX);
     let old = sbi::interrupt::set(false);
@@ -108,12 +108,12 @@ pub fn set_priority(_priority: u32) {
     schedule();
 }
 
-/// (Lab1) Returns the current thread's effective priority.
+/// Returns the current thread's effective priority.
 pub fn get_priority() -> u32 {
     current().effective_priority.load(SeqCst)
 }
 
-/// (Lab1) Make the current thread sleep for the given ticks.
+/// Make the current thread sleep for the given ticks.
 pub fn sleep(ticks: i64) {
     let old = sbi::interrupt::set(false);
 

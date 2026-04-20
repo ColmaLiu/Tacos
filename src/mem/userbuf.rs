@@ -2,6 +2,9 @@
 
 use core::arch::global_asm;
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::error::OsError;
 use crate::mem::in_kernel_space;
 use crate::Result;
@@ -43,6 +46,45 @@ fn write_user_byte(user_src: *const u8, value: u8) -> Result<()> {
     } else {
         Err(OsError::BadPtr)
     }
+}
+
+pub fn read_user_cstr(user_src: *const u8, max_len: usize) -> Result<String> {
+    let mut buf = Vec::new();
+    for i in 0..max_len {
+        let ch = read_user_byte(unsafe { user_src.add(i) })?;
+        if ch == 0 {
+            return String::from_utf8(buf).map_err(|_| OsError::BadPtr);
+        }
+        buf.push(ch);
+    }
+    Err(OsError::BadPtr)
+}
+
+pub fn read_user_buf(user_src: *const u8, len: usize) -> Result<Vec<u8>> {
+    let mut v = Vec::with_capacity(len);
+    for i in 0..len {
+        v.push(read_user_byte(unsafe { user_src.add(i) })?);
+    }
+    Ok(v)
+}
+
+pub fn read_user_usize(user_src: *const u8) -> Result<usize> {
+    let mut bytes = [0u8; core::mem::size_of::<usize>()];
+    for i in 0..bytes.len() {
+        bytes[i] = read_user_byte(unsafe { user_src.add(i) })?;
+    }
+    Ok(usize::from_ne_bytes(bytes))
+}
+
+pub fn write_user_buf(user_dst: *const u8, buf: &[u8]) -> Result<()> {
+    for (i, b) in buf.iter().enumerate() {
+        write_user_byte(unsafe { user_dst.add(i) }, *b)?;
+    }
+    Ok(())
+}
+
+pub fn write_user_usize(user_dst: *const u8, value: usize) -> Result<()> {
+    write_user_buf(user_dst, &value.to_ne_bytes())
 }
 
 extern "C" {
