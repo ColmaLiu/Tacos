@@ -12,11 +12,11 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicIsize, Ordering::SeqCst};
 use riscv::register::sstatus;
 
-use crate::sbi;
-use crate::sync::{Mutex as SyncMutex, Spin};
 use crate::fs::File;
 use crate::mem::pagetable::KernelPgTable;
 use crate::mem::userbuf::{write_user_buf, write_user_usize};
+use crate::sbi;
+use crate::sync::{Mutex as SyncMutex, Spin};
 use crate::thread::{self, Mutex};
 use crate::trap::{trap_exit_u, Frame};
 use crate::userproc::fdtable::FdTable;
@@ -205,8 +205,6 @@ pub fn exit(_value: isize) -> ! {
         .expect("current thread doesn't own a user process");
 
     // Release the executable's deny-write before the parent can observe exit.
-    // This matches the rox tests' expectation that wait() returns only after
-    // the child's executable becomes writable again.
     proc.bin.lock().take();
 
     let cur_tid = cur.id();
