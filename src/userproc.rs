@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering::SeqCst};
 use riscv::register::sstatus;
 
 use crate::fs::File;
@@ -22,21 +23,32 @@ pub use self::fdtable::{FileType, OpenFile, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC,
 
 pub struct UserProc {
     #[allow(dead_code)]
-    bin: File,
-    exit_status: Arc<Mutex<Option<isize>>>,
+    bin: Mutex<Option<File>>,
     pub fd_table: Mutex<FdTable>,
 }
 
 pub struct ProcInfo {
-    parent_tid: isize,
-    exit_status: Arc<Mutex<Option<isize>>>,
+    parent_tid: AtomicIsize,
+    has_exited: AtomicBool,
+    exit_status: AtomicIsize,
+}
+
+const NO_PARENT: isize = -1;
+
+impl ProcInfo {
+    fn new(parent_tid: isize) -> Self {
+        Self {
+            parent_tid: AtomicIsize::new(parent_tid),
+            has_exited: AtomicBool::new(false),
+            exit_status: AtomicIsize::new(0),
+        }
+    }
 }
 
 impl UserProc {
     pub fn new(file: File) -> Self {
         Self {
-            bin: file,
-            exit_status: Arc::new(Mutex::new(None)),
+            bin: Mutex::new(Some(file)),
             fd_table: Mutex::new(FdTable::new()),
         }
     }
@@ -157,32 +169,54 @@ pub fn execute(mut file: File, argv: Vec<String>) -> isize {
     let child = thread::Builder::new(move || start(frame))
         .pagetable(pt)
         .userproc(userproc)
-        .spawn();
+        .build();
 
-    thread::Manager::get().proc_table.lock().insert(
-        child.id(),
-        ProcInfo {
-            parent_tid: thread::current().id(),
-            exit_status: child.userproc.as_ref().unwrap().exit_status.clone(),
-        },
-    );
+    let child_tid = child.id();
 
-    child.id()
+    thread::Manager::get()
+        .proc_table
+        .lock()
+        .insert(child_tid, Arc::new(ProcInfo::new(thread::current().id())));
+
+    thread::Manager::get().register(child);
+    thread::schedule();
+
+    child_tid
 }
 
 /// Exits a process.
 ///
 /// Panic if the current thread doesn't own a user process.
 pub fn exit(_value: isize) -> ! {
-    {
-        let cur = thread::current();
+    let cur = thread::current();
+    let proc = cur
+        .userproc
+        .as_ref()
+        .expect("current thread doesn't own a user process");
 
-        let proc = cur
-            .userproc
-            .as_ref()
-            .expect("current thread doesn't own a user process");
-        *proc.exit_status.lock() = Some(_value);
+    // Release the executable's deny-write before the parent can observe exit.
+    // This matches the rox tests' expectation that wait() returns only after
+    // the child's executable becomes writable again.
+    proc.bin.lock().take();
+
+    let cur_tid = cur.id();
+
+    if let Some(info) = {
+        thread::Manager::get()
+            .proc_table
+            .lock()
+            .get(&cur_tid)
+            .cloned()
+    } {
+        info.exit_status.store(_value, SeqCst);
+        info.has_exited.store(true, SeqCst);
+
+        if info.parent_tid.load(SeqCst) == NO_PARENT {
+            thread::Manager::get().proc_table.lock().remove(&cur_tid);
+        }
     }
+
+    orphan_children(cur_tid);
 
     thread::exit();
 }
@@ -195,24 +229,45 @@ pub fn exit(_value: isize) -> ! {
 pub fn wait(_tid: isize) -> Option<isize> {
     let cur_tid = thread::current().id();
 
-    let status = {
+    let info = {
         let table = thread::Manager::get().proc_table.lock();
-        let info = table.get(&_tid)?;
-        if info.parent_tid != cur_tid {
+        let info = table.get(&_tid)?.clone();
+        if info.parent_tid.load(SeqCst) != cur_tid {
             return None;
         }
-        let status = info.exit_status.clone();
-        status
+        info
     };
 
     loop {
-        let st = status.lock();
-        if let Some(code) = *st {
+        if info.has_exited.load(SeqCst) {
+            let code = info.exit_status.load(SeqCst);
             thread::Manager::get().proc_table.lock().remove(&_tid);
             return Some(code);
         }
-        drop(st);
         thread::schedule();
+    }
+}
+
+fn orphan_children(parent_tid: isize) {
+    let mut table = thread::Manager::get().proc_table.lock();
+    let mut reaped = Vec::new();
+
+    for (&tid, info) in table.iter() {
+        if info
+            .parent_tid
+            .compare_exchange(parent_tid, NO_PARENT, SeqCst, SeqCst)
+            .is_err()
+        {
+            continue;
+        }
+
+        if info.has_exited.load(SeqCst) {
+            reaped.push(tid);
+        }
+    }
+
+    for tid in reaped {
+        table.remove(&tid);
     }
 }
 

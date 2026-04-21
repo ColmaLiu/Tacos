@@ -29,7 +29,7 @@ pub struct Manager {
     /// Sleeping threads sorted by wakeup tick
     pub sleep_queue: Mutex<SleepQueue>,
     /// User process table
-    pub proc_table: Mutex<BTreeMap<isize, ProcInfo>>,
+    pub proc_table: Mutex<BTreeMap<isize, Arc<ProcInfo>>>,
     /// All alive and not yet destroyed threads
     all: Mutex<Vec<Arc<Thread>>>,
 }
@@ -71,7 +71,7 @@ impl Manager {
         &TMANAGER
     }
 
-    pub(super) fn register(&self, thread: Arc<Thread>) {
+    pub(crate) fn register(&self, thread: Arc<Thread>) {
         // Register it into the scheduler
         self.scheduler.lock().register(thread.clone());
 
