@@ -9,9 +9,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering::SeqCst};
+use core::sync::atomic::{AtomicIsize, Ordering::SeqCst};
 use riscv::register::sstatus;
 
+use crate::sbi;
+use crate::sync::{Mutex as SyncMutex, Spin};
 use crate::fs::File;
 use crate::mem::pagetable::KernelPgTable;
 use crate::mem::userbuf::{write_user_buf, write_user_usize};
@@ -29,8 +31,13 @@ pub struct UserProc {
 
 pub struct ProcInfo {
     parent_tid: AtomicIsize,
-    has_exited: AtomicBool,
-    exit_status: AtomicIsize,
+    state: SyncMutex<WaitState, Spin>,
+}
+
+struct WaitState {
+    has_exited: bool,
+    exit_status: isize,
+    waiter: Option<Arc<thread::Thread>>,
 }
 
 const NO_PARENT: isize = -1;
@@ -39,8 +46,11 @@ impl ProcInfo {
     fn new(parent_tid: isize) -> Self {
         Self {
             parent_tid: AtomicIsize::new(parent_tid),
-            has_exited: AtomicBool::new(false),
-            exit_status: AtomicIsize::new(0),
+            state: SyncMutex::new(WaitState {
+                has_exited: false,
+                exit_status: 0,
+                waiter: None,
+            }),
         }
     }
 }
@@ -208,11 +218,17 @@ pub fn exit(_value: isize) -> ! {
             .get(&cur_tid)
             .cloned()
     } {
-        info.exit_status.store(_value, SeqCst);
-        info.has_exited.store(true, SeqCst);
+        let waiter = {
+            let mut state = info.state.lock();
+            state.exit_status = _value;
+            state.has_exited = true;
+            state.waiter.take()
+        };
 
         if info.parent_tid.load(SeqCst) == NO_PARENT {
             thread::Manager::get().proc_table.lock().remove(&cur_tid);
+        } else if let Some(waiter) = waiter {
+            thread::wake_up(waiter);
         }
     }
 
@@ -239,12 +255,24 @@ pub fn wait(_tid: isize) -> Option<isize> {
     };
 
     loop {
-        if info.has_exited.load(SeqCst) {
-            let code = info.exit_status.load(SeqCst);
+        let old = sbi::interrupt::set(false);
+        let current = thread::current();
+        let mut state = info.state.lock();
+
+        if state.has_exited {
+            let code = state.exit_status;
+            drop(state);
+            sbi::interrupt::set(old);
             thread::Manager::get().proc_table.lock().remove(&_tid);
             return Some(code);
         }
+
+        state.waiter = Some(current.clone());
+        current.set_status(thread::Status::Blocked);
+        drop(state);
+
         thread::schedule();
+        sbi::interrupt::set(old);
     }
 }
 
@@ -261,7 +289,7 @@ fn orphan_children(parent_tid: isize) {
             continue;
         }
 
-        if info.has_exited.load(SeqCst) {
+        if info.state.lock().has_exited {
             reaped.push(tid);
         }
     }
