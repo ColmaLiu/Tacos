@@ -8,8 +8,10 @@ use core::slice::from_raw_parts;
 
 use crate::fs::{disk::DISKFS, FileSys};
 use crate::io::{Read, Seek, Write};
+use crate::mem::layout::{MAX_STACK_SIZE, USER_STACK_TOP};
+use crate::mem::suppage::PageSource;
 use crate::mem::userbuf::{read_user_buf, read_user_cstr, read_user_usize, write_user_buf};
-use crate::mem::PageTable;
+use crate::mem::{PageTable, PG_SIZE};
 use crate::sbi::shutdown;
 use crate::thread;
 use crate::userproc::{
@@ -32,6 +34,8 @@ const SYS_SEEK: usize = 9;
 const SYS_TELL: usize = 10;
 const SYS_CLOSE: usize = 11;
 const SYS_FSTAT: usize = 12;
+const SYS_MMAP: usize = 13;
+const SYS_MUNMAP: usize = 14;
 
 pub fn syscall_handler(_id: usize, _args: [usize; 3]) -> isize {
     match _id {
@@ -348,6 +352,146 @@ pub fn syscall_handler(_id: usize, _args: [usize; 3]) -> isize {
 
             0
         }
+        // mapid_t mmap(int fd, void* addr);
+        SYS_MMAP => {
+            let fd = _args[0] as usize;
+            let addr = _args[1] as usize;
+
+            // addr must not be null
+            if addr == 0 {
+                return -1;
+            }
+            // addr must be page-aligned
+            if addr % PG_SIZE != 0 {
+                return -1;
+            }
+            // fd must be > 2 (not stdin/stdout/stderr)
+            if fd <= 2 {
+                return -1;
+            }
+
+            let cur = thread::current();
+            let proc = match cur.userproc.as_ref() {
+                Some(p) => p,
+                None => return -1,
+            };
+
+            // Get file and writability from fd table in one lock
+            let (file, writable) = {
+                let table = proc.fd_table.lock();
+                match table.get(fd) {
+                    Some(of) => match &of.file {
+                        FileType::File(f) => (f.clone(), of.writable),
+                        _ => return -1,
+                    },
+                    None => return -1,
+                }
+            };
+
+            // Check file length > 0
+            let file_len = match file.len() {
+                Ok(l) => l,
+                Err(_) => return -1,
+            };
+            if file_len == 0 {
+                return -1;
+            }
+
+            let pages = (file_len + PG_SIZE - 1) / PG_SIZE;
+
+            // Check overlap with stack
+            {
+                let stk_start = USER_STACK_TOP - MAX_STACK_SIZE;
+                let stk_end = USER_STACK_TOP;
+                let mmap_end = addr + pages * PG_SIZE;
+                if addr < stk_end && mmap_end > stk_start {
+                    return -1;
+                }
+            }
+
+            // Insert into mmap table (checks overlap with existing regions + supp page)
+            let mapid = {
+                let mut mmap_table = proc.mmap_table.lock();
+                let supp_page = proc.supp_page.lock();
+                match mmap_table.insert(
+                    file.clone(),
+                    addr,
+                    file_len,
+                    writable,
+                    &supp_page,
+                ) {
+                    Ok(id) => id,
+                    Err(_) => return -1,
+                }
+            };
+
+            // Insert supp page entries for lazy loading
+            {
+                let mut supp = proc.supp_page.lock();
+                for p in 0..pages {
+                    let page_addr = addr + p * PG_SIZE;
+                    let offset = p * PG_SIZE;
+                    supp.insert(
+                        page_addr,
+                        PageSource::MmapFile {
+                            file: file.clone(),
+                            offset,
+                            mapid,
+                            writable,
+                        },
+                    );
+                }
+            }
+
+            mapid as isize
+        }
+        // void munmap(mapid_t mapping);
+        SYS_MUNMAP => {
+            let mapid = _args[0] as usize;
+
+            let cur = thread::current();
+            let proc = match cur.userproc.as_ref() {
+                Some(p) => p,
+                None => return -1,
+            };
+
+            // Remove from mmap table first (validates mapid)
+            let _region = {
+                let mut mmap_table = proc.mmap_table.lock();
+                match mmap_table.remove(mapid) {
+                    Some(r) => r,
+                    None => return -1,
+                }
+            };
+
+            // Step 1: collect dirty pages to write back
+            let writebacks = {
+                let supp = proc.supp_page.lock();
+                let pagetable = unsafe { PageTable::effective_pagetable() };
+                supp.collect_dirty_writebacks(mapid, &pagetable)
+            };
+
+            // Step 2: write back dirty pages (no locks held)
+            for (file, offset, data) in &writebacks {
+                let mut f = file.clone();
+                use crate::io::Seek;
+                if let Ok(pos) = f.pos() {
+                    *pos = *offset;
+                }
+                use crate::io::Write;
+                let _ = f.write(data);
+            }
+
+            // Step 3: clean up frames, unmap PTEs, remove supp entries
+            {
+                let mut supp = proc.supp_page.lock();
+                let mut pagetable = unsafe { PageTable::effective_pagetable() };
+                let mut frame_table = crate::mem::frame::FrameTable::instance().lock();
+                supp.cleanup_mapid(mapid, &mut pagetable, &mut frame_table);
+            }
+
+            0
+        }
         _ => unreachable!(),
     }
 }
@@ -359,16 +503,29 @@ fn is_valid_area(ptr: *const u8, len: usize) -> bool {
         None => return false,
     };
     let table = unsafe { PageTable::effective_pagetable() };
+
+    // Acquire supp_page lock once to check all non-present pages
+    let cur = thread::current();
+    let supp = cur.userproc.as_ref().map(|p| p.supp_page.lock());
+
     for addr in (start..end).step_by(4096) {
         match table.get_pte(addr) {
             Some(entry) if entry.is_valid() => (),
-            Some(_) | None => return false,
+            _ => {
+                if supp.as_ref().map_or(true, |s| !s.contains(addr)) {
+                    return false;
+                }
+            }
         };
     }
     if len > 1 {
         match table.get_pte(end - 1) {
             Some(entry) if entry.is_valid() => (),
-            Some(_) | None => return false,
+            _ => {
+                if supp.as_ref().map_or(true, |s| !s.contains(end - 1)) {
+                    return false;
+                }
+            }
         };
     }
     true

@@ -7,10 +7,12 @@
 //! memory(pm): kvm = pm + [mem::OFFSET].
 //!
 
+pub mod frame;
 pub mod layout;
 pub mod malloc;
 pub mod pagetable;
 pub mod palloc;
+pub mod suppage;
 pub mod userbuf;
 mod utils;
 

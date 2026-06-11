@@ -8,7 +8,7 @@ use crate::sync::{Intr, Lazy, Mutex};
 // BuddyAllocator allocates at most `1<<MAX_ORDER` pages at a time
 const MAX_ORDER: usize = 8;
 // How many pages are there in the user memory pool
-pub(super) const USER_POOL_LIMIT: usize = 256;
+pub(super) const USER_POOL_LIMIT: usize = 512;
 
 /// Buddy Allocator. It allocates and deallocates memory page-wise.
 #[derive(Debug)]
@@ -53,18 +53,16 @@ impl BuddyAllocator {
         }
     }
 
-    /// Allocate n pages and returns the virtual address.
-    unsafe fn alloc(&mut self, n: usize) -> *mut u8 {
-        assert!(n <= 1 << MAX_ORDER, "request is too large");
+    /// Try to allocate n pages. Returns None on OOM instead of panicking.
+    unsafe fn try_alloc(&mut self, n: usize) -> Option<*mut u8> {
+        if n > 1 << MAX_ORDER {
+            return None;
+        }
 
         let order = n.next_power_of_two().trailing_zeros() as usize;
         for i in order..self.free_lists.len() {
-            // Find the first non-empty list
             if !self.free_lists[i].is_empty() {
-                // Split buffers (from large to small groups)
                 for j in (order..i).rev() {
-                    // Try to find a large block of group j+1 and then
-                    // split it into two blocks of group j
                     if let Some(block) = self.free_lists[j + 1].pop() {
                         let half = (block as usize + (1 << j) * PG_SIZE) as *mut usize;
                         self.free_lists[j].push(half);
@@ -72,11 +70,21 @@ impl BuddyAllocator {
                     }
                 }
                 self.allocated += 1 << order;
-                return self.free_lists[order].pop().unwrap().cast();
+                return Some(self.free_lists[order].pop().unwrap().cast());
             }
         }
 
-        unreachable!("memory is exhausted");
+        None
+    }
+
+    /// Allocate n pages and returns the virtual address.
+    unsafe fn alloc(&mut self, n: usize) -> *mut u8 {
+        self.try_alloc(n).expect("memory is exhausted")
+    }
+
+    /// Returns the number of free pages
+    fn available(&self) -> usize {
+        self.total / PG_SIZE - self.allocated
     }
 
     /// Deallocate a chunk of pages
@@ -148,6 +156,16 @@ impl UserPool {
     /// Allocate n pages of consecutive space
     pub unsafe fn alloc_pages(n: usize) -> *mut u8 {
         Self::instance().lock().alloc(n)
+    }
+
+    /// Try to allocate n pages; returns None if the pool is exhausted.
+    pub unsafe fn try_alloc_pages(n: usize) -> Option<*mut u8> {
+        Self::instance().lock().try_alloc(n)
+    }
+
+    /// Returns the number of free pages remaining.
+    pub fn available() -> usize {
+        Self::instance().lock().available()
     }
 
     /// Free n pages of memory starting at `ptr`

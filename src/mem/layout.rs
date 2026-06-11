@@ -31,3 +31,8 @@ pub const KERN_BASE: usize = 0x0000000080200000;
 pub const VM_OFFSET: usize = VM_BASE - PM_BASE;
 pub const PLIC_BASE: usize = 0xC000000 + VM_OFFSET;
 pub const MMIO_BASE: usize = 0x10001000 + VM_OFFSET;
+
+/// Top of the user stack (grows downward)
+pub const USER_STACK_TOP: usize = 0x80500000;
+/// Maximum stack size (8 MB)
+pub const MAX_STACK_SIZE: usize = 8 * 1024 * 1024;

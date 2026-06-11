@@ -87,6 +87,24 @@ impl PageTable {
         })
     }
 
+    /// Mutable version of get_pte
+    pub fn get_pte_mut(&mut self, va: usize) -> Option<&mut Entry> {
+        let l1 = self.walk(Self::px(2, va))?;
+        let l0 = l1.walk(Self::px(1, va))?;
+        l0.entries.get_mut(Self::px(0, va))
+    }
+
+    /// Unmaps the page at `va`: clears the V bit, sfence.vma, and returns the old Entry
+    pub fn unmap(&mut self, va: usize) -> Option<Entry> {
+        let entry = self.get_pte_mut(va)?;
+        let old = *entry;
+        entry.clear_flags(PTEFlags::V);
+        unsafe {
+            core::arch::asm!("sfence.vma {}, zero", in(reg) va);
+        }
+        Some(old)
+    }
+
     /// Free all memory used by this pagetable back to where they were allocated.
     pub unsafe fn destroy(&mut self) {
         unsafe fn destroy_imp(pgt: &mut PageTable, level: usize) {

@@ -1,7 +1,7 @@
 //! Trap handler
 //!
 
-mod pagefault;
+pub(crate) mod pagefault;
 mod syscall;
 
 use crate::device::{plic, virtio};

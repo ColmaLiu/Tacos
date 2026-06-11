@@ -15,7 +15,7 @@ use crate::userproc::UserProc;
 pub const PRI_DEFAULT: u32 = 31;
 pub const PRI_MAX: u32 = 63;
 pub const PRI_MIN: u32 = 0;
-pub const STACK_SIZE: usize = PG_SIZE * 4;
+pub const STACK_SIZE: usize = PG_SIZE * 8;
 pub const STACK_ALIGN: usize = 16;
 pub const STACK_TOP: usize = 0x80500000;
 pub const MAGIC: usize = 0xdeadbeef;

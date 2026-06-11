@@ -4,7 +4,7 @@ use elf_rs::{Elf, ElfFile, ProgramHeaderEntry, ProgramHeaderFlags, ProgramType};
 use crate::fs::File;
 use crate::io::prelude::*;
 use crate::mem::pagetable::{PTEFlags, PageTable};
-use crate::mem::palloc::UserPool;
+use crate::mem::suppage::{PageSource, SuppPageTable};
 use crate::mem::{div_round_up, PageAlign, PhysAddr, PG_MASK, PG_SIZE};
 use crate::{OsError, Result};
 
@@ -14,30 +14,33 @@ pub(super) struct ExecInfo {
     pub init_sp: usize,
 }
 
-/// Loads an executable file
+/// Loads an executable file lazily.
 ///
-/// ## Params
-/// - `pagetable`: User's pagetable. We install the mapping to executable codes into it.
+/// Returns the supplementary page table populated with segment metadata
+/// and the initial user stack page (allocated eagerly).
 ///
 /// ## Return
-/// On success, returns `Ok(usize, usize)`:
-/// - arg0: the entry point of user program
-/// - arg1: the initial sp of user program
-pub(super) fn load_executable(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
-    let exec_info = load_elf(file, pagetable)?;
+/// On success, returns `Ok((ExecInfo, SuppPageTable))`.
+pub(super) fn load_executable(
+    file: &mut File,
+    pagetable: &mut PageTable,
+) -> Result<(ExecInfo, SuppPageTable)> {
+    let mut supp_page = SuppPageTable::new();
 
-    // Initialize user stack.
-    init_user_stack(pagetable, exec_info.init_sp);
+    let exec_info = load_elf(file, &mut supp_page)?;
+
+    // Initialize user stack (first page eagerly, as required).
+    init_user_stack(pagetable, exec_info.init_sp, &mut supp_page);
 
     // Forbid modifying executable file when running
     file.deny_write();
 
-    Ok(exec_info)
+    Ok((exec_info, supp_page))
 }
 
-/// Parses the specified executable file and loads segments
-fn load_elf(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
-    // Ensure cursor is at the beginning
+/// Parses the ELF and records segment metadata in the supp page table.
+/// No physical pages are allocated — all done lazily via page faults.
+fn load_elf(file: &mut File, supp_page: &mut SuppPageTable) -> Result<ExecInfo> {
     file.rewind()?;
 
     let len = file.len()?;
@@ -49,10 +52,10 @@ fn load_elf(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
         Ok(Elf::Elf32(_)) | Err(_) => return Err(OsError::UnknownFormat),
     };
 
-    // load each loadable segment into memory
+    // Record metadata for each loadable segment
     elf.program_header_iter()
         .filter(|p| p.ph_type() == ProgramType::LOAD)
-        .for_each(|p| load_segment(&buf, &p, pagetable));
+        .for_each(|p| record_segment(file, &p, supp_page));
 
     Ok(ExecInfo {
         entry_point: elf.elf_header().entry_point() as _,
@@ -60,16 +63,14 @@ fn load_elf(file: &mut File, pagetable: &mut PageTable) -> Result<ExecInfo> {
     })
 }
 
-/// Loads one segment and installs pagetable mappings
-fn load_segment(filebuf: &[u8], phdr: &ProgramHeaderEntry, pagetable: &mut PageTable) {
+/// Records per-page metadata in the supplementary page table for a LOAD segment.
+/// Each page is tagged with the file handle, file offset, segment size, and PTE flags.
+fn record_segment(file: &File, phdr: &ProgramHeaderEntry, supp_page: &mut SuppPageTable) {
     assert_eq!(phdr.ph_type(), ProgramType::LOAD);
 
-    // Meaningful contents of this segment starts from `fileoff`.
     let fileoff = phdr.offset() as usize;
-    // But we will read and install from `read_pos`.
     let mut readpos = fileoff & !PG_MASK;
 
-    // Install flags.
     let mut leaf_flag = PTEFlags::V | PTEFlags::U | PTEFlags::R;
     if phdr.flags().contains(ProgramHeaderFlags::EXECUTE) {
         leaf_flag |= PTEFlags::X;
@@ -78,43 +79,46 @@ fn load_segment(filebuf: &[u8], phdr: &ProgramHeaderEntry, pagetable: &mut PageT
         leaf_flag |= PTEFlags::W;
     }
 
-    // Install position: `ubase`.
     let ubase = (phdr.vaddr() as usize) & !PG_MASK;
     let pageoff = (phdr.vaddr() as usize) & PG_MASK;
     assert_eq!(fileoff & PG_MASK, pageoff);
 
-    // How many pages need to be allocated
     let pages = div_round_up(pageoff + phdr.memsz() as usize, PG_SIZE);
-    let mut readbytes = phdr.filesz() as usize + pageoff;
+    let filesz = phdr.filesz() as usize;
+    let file_end = fileoff + filesz;
 
-    // Allocate & map pages
     for p in 0..pages {
-        let buf = unsafe { UserPool::alloc_pages(1) };
-        let page = unsafe { (buf as *mut [u8; PG_SIZE]).as_mut().unwrap() };
-
-        // Read `readsz` bytes, fill remaining bytes with 0.
-        let readsz = readbytes.min(PG_SIZE);
-        page[..readsz].copy_from_slice(&filebuf[readpos..readpos + readsz]);
-        page[readsz..].fill(0);
-
-        // The installed page will be freed when pagetable drops, which happens
-        // when user process exits. No manual resource collect is required.
         let uaddr = ubase + p * PG_SIZE;
-        pagetable.map(buf.into(), uaddr, 1, leaf_flag);
+        let file_offset = readpos;
+        let page_filesz = if file_offset >= file_end {
+            0
+        } else {
+            (file_end - file_offset).min(PG_SIZE)
+        };
 
-        readbytes -= readsz;
-        readpos += readsz;
+        supp_page.insert(
+            uaddr,
+            PageSource::InFile {
+                file: file.clone(),
+                offset: file_offset,
+                filesz: page_filesz,
+                flags: leaf_flag,
+            },
+        );
+
+        readpos += PG_SIZE;
     }
-
-    assert_eq!(readbytes, 0);
 }
 
-/// Initializes the user stack.
-fn init_user_stack(pagetable: &mut PageTable, init_sp: usize) {
+/// Initializes the user stack with one eagerly allocated page.
+fn init_user_stack(pagetable: &mut PageTable, init_sp: usize, supp_page: &mut SuppPageTable) {
     assert!(init_sp % PG_SIZE == 0, "initial sp address misaligns");
 
-    // Allocate a page from UserPool as user stack.
-    let stack_va = unsafe { UserPool::alloc_pages(1) };
+    // Allocate a page from UserPool as user stack, evicting if necessary.
+    let stack_va = crate::trap::pagefault::allocate_or_evict();
+    if stack_va.is_null() {
+        panic!("Cannot allocate initial stack page");
+    }
     let stack_pa = PhysAddr::from(stack_va);
 
     // Get the start address of stack page
@@ -123,6 +127,20 @@ fn init_user_stack(pagetable: &mut PageTable, init_sp: usize) {
     // Install mapping
     let flags = PTEFlags::V | PTEFlags::R | PTEFlags::W | PTEFlags::U;
     pagetable.map(stack_pa, stack_page_begin, PG_SIZE, flags);
+
+    // Record in supplementary page table
+    supp_page.insert(
+        stack_page_begin,
+        PageSource::AnonFrame {
+            phys_addr: stack_pa.value(),
+            flags,
+        },
+    );
+
+    // Register in global frame table so this frame can be tracked for eviction
+    crate::mem::frame::FrameTable::instance()
+        .lock()
+        .register(stack_pa.value(), -1, stack_page_begin);
 
     #[cfg(feature = "debug")]
     kprintln!(

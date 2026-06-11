@@ -79,13 +79,37 @@ impl Entry {
         self.flag().contains(PTEFlags::A)
     }
 
-    // TODO: should implement in pagetable, and re-activate
     pub fn set_invalid(&mut self) {
         self.0 &= !PTEFlags::V.bits;
     }
 
     pub fn set_unaccessed(&mut self) {
         self.0 &= !PTEFlags::A.bits;
+    }
+
+    pub fn set_undirty(&mut self) {
+        self.0 &= !PTEFlags::D.bits;
+    }
+
+    pub fn ppn_raw(&self) -> usize {
+        self.0 >> Self::FLAG_SHIFT & PPN_MASK
+    }
+
+    pub fn set_ppn(&mut self, ppn: usize) {
+        let flags = self.0 & ((1 << Self::FLAG_SHIFT) - 1);
+        self.0 = (ppn << Self::FLAG_SHIFT) | flags;
+    }
+
+    pub fn clear_flags(&mut self, flags: PTEFlags) {
+        self.0 &= !flags.bits();
+    }
+
+    pub fn set_flags(&mut self, flags: PTEFlags) {
+        self.0 |= flags.bits();
+    }
+
+    pub fn flags(&self) -> PTEFlags {
+        self.flag()
     }
 
     /// A PTE is a leaf PTE when at least one bit in R, W and X

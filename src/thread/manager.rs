@@ -71,6 +71,10 @@ impl Manager {
         &TMANAGER
     }
 
+    pub fn find_thread(&self, tid: isize) -> Option<Arc<Thread>> {
+        self.all.lock().iter().find(|t| t.id() == tid).cloned()
+    }
+
     pub(crate) fn register(&self, thread: Arc<Thread>) {
         // Register it into the scheduler
         self.scheduler.lock().register(thread.clone());

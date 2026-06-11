@@ -9,7 +9,7 @@ mod swap;
 // Expose path for it is frequently used.
 pub use self::path::Path;
 // Expose swap utils.
-pub use self::swap::Swap;
+pub use self::swap::{Swap, SwapManager};
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
